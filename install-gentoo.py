@@ -23,7 +23,7 @@ for module, pkg in dependencies.items():
 
 if missing_pkgs:
     cmd = ["emerge --sync --quiet && emerge -v",] + missing_pkgs  #  Emerge -av --ask --verbose else emerge foo --quiet to shut up build/emerge messages
-# emerge --sync --quiet and or emerge-webrsync --quiet gets all the updates for ebuild scripts/security/etc 
+# emerge --sync --quiet and or emerge-webrsync --quiet gets all the updates for ebuild scripts/security/metadata/etc 
     print(" ".join(cmd))
     call(cmd)
 
