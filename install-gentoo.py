@@ -7,9 +7,9 @@ dependencies = {
     "Crypto": "dev-python/pycrypto",
     "dpkt": "dev-python/dpkt",
     "IPy": "dev-python/ipy",
-    "pcap": "dev-python/pypcap"
-    "pygeoip" : "dev-python/pygeoip"
-    "pydoc":"dev-python/epydoc" #Installs pydoc happydoc is the alternative. 
+    "pcap": "dev-python/pypcap",
+    "pygeoip" : "dev-python/pygeoip",
+    "pydoc":"dev-python/epydoc", 
  }
 
 installed, missing_pkgs = [pkg[1] for pkg in iter_modules()], []
@@ -24,7 +24,11 @@ for module, pkg in dependencies.items():
 if missing_pkgs:
     print("Hello, Calling Emerge to Build packages that are missing")
     cmd = ["emerge --sync --quiet && emerge -v",] + missing_pkgs 
-    call(["make", "all"]) 
+
+    print(" ".join(cmd))
+    call(cmd)
+
+call(["make", "all"])
 #Notes to DSHELL TEAM. can TRIM this DOWN if you wish. this is hear as a conveniance/reffrance to you. 
 #  Emerge -av --ask --verbose else emerge foo --quiet to shut up build/emerge messages
 # emerge --sync --quiet and or emerge-webrsync --quiet gets all the updates for ebuild scripts/security/metadata/etc , updates to portage spam the console, 
