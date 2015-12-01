@@ -1,3 +1,12 @@
+#DESTDIR = $(/usr/bin/Dshell)
+#DESTDIR="${D}" 
+#SOURCEDIR = $(PWD)
+#INSTALL = /usr/sbin/install
+#.PHONY mklink
+
+#mklink:
+ #   test -e /usr/share/GeoIP/*.* || exit 1
+ #   cp -s /usr/share/GeoIP/*.*  /usr/bin/Dshell/share/GeoIP  # copy symlinks 
 default: all
 
 all: rc dshell
@@ -37,3 +46,7 @@ clean_pyc:
 
 clean_pydoc:
 	find $(PWD)/doc -name '*.htm*' -exec rm -v {} \;
+
+#clean_install_dir_extras:
+#	rm -rv ${D}/docker/
+#	rm -fv ${D}.git/
