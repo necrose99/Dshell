@@ -1,3 +1,16 @@
+# https://stackoverflow.com/questions/1950926/create-directories-using-make-file
+# /opt/dshell wasnt creating under emake for gentoo... sandbox , granded I'll have to replace some files... 
+MKDIR_P = mkdir -p
+
+.PHONY: directories
+
+all: directories program 
+## recursive make-of-tree 
+directories: ${DESTDIR} ${DESTDIR}/dshell {DESTDIR}/bin {DESTDIR}/dshell-decode {DESTDIR}/lib {DESTDIR}/doc {DESTDIR}/share/GeoIP
+
+${DESTDIR}:
+        ${MKDIR_P} ${DESTDIR}
+
 USER=$(shell id -u)
 
 ifeq ($(USER),0)
@@ -5,6 +18,12 @@ ifeq ($(USER),0)
 	DESTDIR=/opt/dshell
 	DESTPERMS=755
 	SYMLINKDIR=/usr/bin
+	ln-s {DESTDIR}/doc /usr/share/doc/dshell/  # Link docs to usual location/s. 
+	## TODO...
+	#cat-df-dhsell.sh /etc/skell/dshell/  
+	# add skell , ie /home/someuser/.dshell/dshellrc etc..  ../plugins , etc , include dhsellrc main , and user folder editable perms.
+        # skell can populate to user/s and or dammeons.  adds back some user only install... , ie plugins user mode folders.. 
+	 
 else
 	# As a normal user, build Dshell locally
 	DESTDIR=$(PWD)
@@ -25,14 +44,14 @@ install: install_dshell dshell install_symlinks
 install_dshell:
 	# Copying files to DESTDIR
 	$(info Installing Dshell in $(DESTDIR))
-	mkdir -m $(DESTPERMS) -p $(DESTDIR)
+	mkdir -m $(DESTPERMS) -p $(DESTDIR){$(DESTDIR/bin 
 	rsync -va . $(DESTDIR) --exclude install/ --exclude dshell --exclude dshell-decode --exclude install-ubuntu.py
 
 rc:
 	# Generating .dshellrc and dshell files
 	python $(DESTDIR)/bin/generate-dshellrc.py $(DESTDIR)
 	chmod 755 $(DESTDIR)/dshell
-	chmod 755 $(DESTDIR)/dshell-decode
+	chmod 755 $ 
 	chmod 755 $(DESTDIR)/bin/decode.py
 	ln -fvs $(DESTDIR)/bin/decode.py $(DESTDIR)/bin/decode
 
