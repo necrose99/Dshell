@@ -386,14 +386,7 @@ class Decoder(object):
             else:
                 direction = 'sc'
 
-            # check direction and blob count.
-            # If we have switched direction but already have max blobs
-            # close connection and replace it with a new one
-            if self.maxblobs and (direction != conn.direction) and (len(conn.blobs) == self.maxblobs):
-                self.close(conn)  # close and call handlers
-                # recurse to create a new connection for the next
-                # request/response
-                return self.track(addr, data, ts)
+            original_direction = conn.direction
 
             # update the connection to update current blob or start a new one
             # and return the last one
@@ -401,6 +394,16 @@ class Decoder(object):
             blob = conn.update(ts, direction, data, offset=offset)
             if blob and self.isBlobHandlerPresent:
                 self.blobHandler(conn, blob)
+
+            # check direction and blob count.
+            # If we have switched direction but already have max blobs
+            # close connection and replace it with a new one
+            if self.maxblobs and (direction != original_direction) and (len(conn.blobs) >= self.maxblobs):
+                self.close(conn)  # close and call handlers
+                # recurse to create a new connection for the next
+                # request/response
+                return self.track(addr, ts=ts, **kwargs)
+
             # we can discard all but the last blob
             if not self.isConnectionHandlerPresent:
                 while len(conn.blobs) > 1:
@@ -637,6 +640,13 @@ class UDPDecoder(IPDecoder):
                 return self.packetHandler(udp=Packet(self, addr, pkt=pkt, ts=ts, **kwargs), data=data)
 
             # if no PacketHandler, we need to track state
+            conn = self.find(addr)
+            if not conn:
+                conn = self.track(addr, ts=ts, state='init', **kwargs)
+            if conn.nextoffset['cs'] is None:
+                conn.nextoffset['cs'] = 0
+            if conn.nextoffset['sc'] is None:
+                conn.nextoffset['sc'] = 0
             self.track(addr, data, ts, **kwargs)
 
         except Exception, e:
@@ -705,33 +715,49 @@ class TCPDecoder(UDPDecoder):
         self.count += 1
 
         try:
-            # close connection
+            # attempt to find an existing connection for this address
             conn = self.find(addr)
-            if tcp.flags & (dpkt.tcp.TH_FIN | dpkt.tcp.TH_RST) and conn:
-                conn.closeIP(addr[0]) #track if FIN has been seen in connection
-            if conn and conn.connectionClosed():
-                # we might occasionally have data in a FIN packet
-                self.track(addr, str(tcp.data), ts, offset=tcp.seq)
-                self.close(conn, ts)
-            # init connection, set TCP ISN
-            elif not self.ignore_handshake and (tcp.flags == dpkt.tcp.TH_SYN or tcp.flags == dpkt.tcp.TH_SYN | dpkt.tcp.TH_CWR | dpkt.tcp.TH_ECE):
-                if conn:
-                    self.track(addr, str(tcp.data), ts, offset=tcp.seq)
-                    self.close(conn, ts)
-                conn = self.track(addr, ts=ts, state='init', **kwargs)
-                if conn:
-                    conn.nextoffset['cs'] = tcp.seq + 1
-            # SYN ACK
-            elif not self.ignore_handshake and tcp.flags == (dpkt.tcp.TH_SYN | dpkt.tcp.TH_ACK):
-                conn = self.find(addr, state='init')
-                if conn and tcp.ack == conn.nextoffset['cs']:
-                    conn.nextoffset['sc'] = tcp.seq + 1
-                    conn.state = 'established'
 
-            # all other states, or always if ignoring handshake
-            if self.ignore_handshake or self.find(addr, state='established'):
+            if self.ignore_handshake:
+                # if we are ignoring handshakes, we will track all connections,
+                # even if we did not see the initialization handshake.
+                if not conn:
+                    conn = self.track(addr, ts=ts, state='init', **kwargs)
+                # align the sequence numbers when we first see a connection
+                if conn.nextoffset['cs'] is None and addr == conn.addr:
+                    conn.nextoffset['cs'] = tcp.seq + 1
+                elif conn.nextoffset['sc'] is None and addr != conn.addr:
+                    conn.nextoffset['sc'] = tcp.seq + 1
                 self.track(addr, str(tcp.data), ts,
-                           state='established', offset=tcp.seq, **kwargs)
+                    state='established', offset=tcp.seq, **kwargs)
+
+            else:
+                # otherwise, only track connections if we see a TCP handshake
+                if (tcp.flags == dpkt.tcp.TH_SYN
+                    or tcp.flags == dpkt.tcp.TH_SYN | dpkt.tcp.TH_CWR | dpkt.tcp.TH_ECE):
+                    # SYN
+                    if conn:
+                        # if a connection already exists for the addr,
+                        # close the old one to start fresh
+                        self.close(conn, ts)
+                    conn = self.track(addr, ts=ts, state='init', **kwargs)
+                    if conn:
+                        conn.nextoffset['cs'] = tcp.seq + 1
+                elif tcp.flags == (dpkt.tcp.TH_SYN | dpkt.tcp.TH_ACK):
+                    # SYN ACK
+                    if conn and tcp.ack == conn.nextoffset['cs']:
+                        conn.nextoffset['sc'] = tcp.seq + 1
+                        conn.state = 'established'
+                if conn and conn.state == 'established':
+                    self.track(addr, str(tcp.data), ts,
+                        state='established', offset=tcp.seq, **kwargs)
+
+            # close connection
+            if conn and tcp.flags & (dpkt.tcp.TH_FIN | dpkt.tcp.TH_RST):
+                # flag that an IP is closing a connection with FIN or RST
+                conn.closeIP(addr[0])
+            if conn and conn.connectionClosed():
+                self.close(conn, ts)
 
         except Exception, e:
             self._exc(e)
@@ -875,7 +901,7 @@ class Connection(Packet):
     def __init__(self, decoder, addr, ts=None, **kwargs):
         self.state = None
         # the offset we expect for the next blob in this direction
-        self.nextoffset = {'cs': 0, 'sc': 0}
+        self.nextoffset = {'cs': None, 'sc': None}
         # init IP-level data
         Packet.__init__(self, decoder, addr, ts=ts, **kwargs)
         self.clientip, self.clientport, self.serverip, self.serverport = (
@@ -1024,7 +1050,7 @@ class Blob(Data):
         '''returns segments of blob as string'''
         return self.data(padding='')
 
-    def data(self, errorHandler=None, padding=None, overlap=True, caller=None, dup=-1):
+    def data(self, errorHandler=None, padding=None, overlap=True, caller=None):
         '''returns segments of blob reassembled into a string
            if next segment offset is not the expected offset
            errorHandler(blob,expected,offset) will be called
@@ -1041,6 +1067,7 @@ class Blob(Data):
             dup: how to handle duplicate segments:
                 0: use first segment seen
                 -1 (default): use last segment seen
+            changing duplicate segment handling to always take largest segment
         '''
         d = ''
         nextoffset = self.startoffset
@@ -1060,12 +1087,17 @@ class Blob(Data):
                         raise KeyError(nextoffset)
                 elif segoffset < nextoffset and not overlap:
                     continue  # skip if not allowing overlap
+            #find most data in segments
+            seg = ''
+            for x in self.segments[segoffset]:
+                if len(x) > len(seg):
+                    seg = x
             # advance next expected offset
             nextoffset = (
-                segoffset + len(self.segments[segoffset][dup])) & self.MAX_OFFSET
+                segoffset + len(seg)) & self.MAX_OFFSET
             # append or splice data
             d = d[:segoffset - self.startoffset] + \
-                self.segments[segoffset][dup] + \
+                seg + \
                 d[nextoffset - self.startoffset:]
         return d
 
