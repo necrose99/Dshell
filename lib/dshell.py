@@ -386,14 +386,7 @@ class Decoder(object):
             else:
                 direction = 'sc'
 
-            # check direction and blob count.
-            # If we have switched direction but already have max blobs
-            # close connection and replace it with a new one
-            if self.maxblobs and (direction != conn.direction) and (len(conn.blobs) == self.maxblobs):
-                self.close(conn)  # close and call handlers
-                # recurse to create a new connection for the next
-                # request/response
-                return self.track(addr, data, ts)
+            original_direction = conn.direction
 
             # update the connection to update current blob or start a new one
             # and return the last one
@@ -401,6 +394,16 @@ class Decoder(object):
             blob = conn.update(ts, direction, data, offset=offset)
             if blob and self.isBlobHandlerPresent:
                 self.blobHandler(conn, blob)
+
+            # check direction and blob count.
+            # If we have switched direction but already have max blobs
+            # close connection and replace it with a new one
+            if self.maxblobs and (direction != original_direction) and (len(conn.blobs) >= self.maxblobs):
+                self.close(conn)  # close and call handlers
+                # recurse to create a new connection for the next
+                # request/response
+                return self.track(addr, ts=ts, **kwargs)
+
             # we can discard all but the last blob
             if not self.isConnectionHandlerPresent:
                 while len(conn.blobs) > 1:
@@ -423,6 +426,23 @@ class Decoder(object):
                 raise Exception('packet truncated', pktlen, pktdata)
             # decode with the L2 decoder (probably Ether)
             pkt = self.l2decoder(pktdata)
+            # attempt to collect MAC addresses
+            if type(pkt) == dpkt.ethernet.Ethernet:
+                try:
+                    smac = "%02x:%02x:%02x:%02x:%02x:%02x" % (struct.unpack("BBBBBB", pkt.src))
+                    dmac = "%02x:%02x:%02x:%02x:%02x:%02x" % (struct.unpack("BBBBBB", pkt.dst))
+                except struct.error:  # couldn't get MAC address
+                    smac, dmac = None, None
+                kw.update(smac=smac, dmac=dmac)
+            elif type(pkt) == dpkt.sll.SLL:
+                try:
+                    # Sometimes MAC address will show up as 00:00:00:00:00:00
+                    # TODO decide if it should be set to None or kept as-is
+                    smac = "%02x:%02x:%02x:%02x:%02x:%02x" % (struct.unpack("BBBBBB", pkt.hdr[:pkt.hlen]))
+                    dmac = None
+                except struct.error:
+                    smac, dmac = None, None
+                kw.update(smac=smac, dmac=dmac)
             # strip any intermediate layers (PPPoE, etc)
             for _ in xrange(int(self.striplayers)):
                 pkt = pkt.data
@@ -504,13 +524,6 @@ class IPDecoder(Decoder):
         if 6to4, unencaps the IPv6
         If IP/IP6, hands off to IPDecoder via IPHandler()'''
         try:
-            # If this packet has an Ethernet header, try and grab the MAC address
-            if type(pkt) == dpkt.ethernet.Ethernet:
-                try:
-                    smac = "%02x:%02x:%02x:%02x:%02x:%02x" % (struct.unpack("BBBBBB", pkt.src))
-                    dmac = "%02x:%02x:%02x:%02x:%02x:%02x" % (struct.unpack("BBBBBB", pkt.dst))
-                except struct.error:  # couldn't get MAC address
-                    smac, dmac = None, None
             # if this is an IPv4 packet, defragment, decode and hand it off
             if type(pkt.data) == dpkt.ip.IP:
                 if self.defrag:
@@ -538,7 +551,6 @@ class IPDecoder(Decoder):
                                        proto=self.IP_PROTO_MAP.get(
                                            pkt.p, pkt.p),
                                        sipint=sipint, dipint=dipint,
-                                       smac=smac, dmac=dmac,
                                        **kwargs)
             if pkt and type(pkt.data) == dpkt.ip6.IP6:
                 pkt = pkt.data  # no defrag of ipv6
@@ -560,7 +572,6 @@ class IPDecoder(Decoder):
                                pkttype=dpkt.ethernet.ETH_TYPE_IP6,
                                proto=self.IP_PROTO_MAP.get(pkt.nxt, pkt.nxt),
                                sipint=sipint, dipint=dipint,
-                               smac=smac, dmac=dmac,
                                **kwargs)
         except Exception, e:
             self._exc(e)
@@ -629,6 +640,13 @@ class UDPDecoder(IPDecoder):
                 return self.packetHandler(udp=Packet(self, addr, pkt=pkt, ts=ts, **kwargs), data=data)
 
             # if no PacketHandler, we need to track state
+            conn = self.find(addr)
+            if not conn:
+                conn = self.track(addr, ts=ts, state='init', **kwargs)
+            if conn.nextoffset['cs'] is None:
+                conn.nextoffset['cs'] = 0
+            if conn.nextoffset['sc'] is None:
+                conn.nextoffset['sc'] = 0
             self.track(addr, data, ts, **kwargs)
 
         except Exception, e:
@@ -697,29 +715,49 @@ class TCPDecoder(UDPDecoder):
         self.count += 1
 
         try:
-            # close connection
-            if tcp.flags & (dpkt.tcp.TH_FIN | dpkt.tcp.TH_RST):
-                conn = self.find(addr)
-                if conn:
-                    # we might occasionally have data in a FIN packet
-                    self.track(addr, str(tcp.data), ts, offset=tcp.seq)
-                    self.close(conn, ts)
-            # init connection, set TCP ISN
-            elif not self.ignore_handshake and tcp.flags == dpkt.tcp.TH_SYN:
-                conn = self.track(addr, ts=ts, state='init', **kwargs)
-                if conn:
-                    conn.nextoffset['cs'] = tcp.seq + 1
-            # SYN ACK
-            elif not self.ignore_handshake and tcp.flags == (dpkt.tcp.TH_SYN | dpkt.tcp.TH_ACK):
-                conn = self.find(addr, state='init')
-                if conn and tcp.ack == conn.nextoffset['cs']:
-                    conn.nextoffset['sc'] = tcp.seq + 1
-                    conn.state = 'established'
+            # attempt to find an existing connection for this address
+            conn = self.find(addr)
 
-            # all other states, or always if ignoring handshake
-            if self.ignore_handshake or self.find(addr, state='established'):
+            if self.ignore_handshake:
+                # if we are ignoring handshakes, we will track all connections,
+                # even if we did not see the initialization handshake.
+                if not conn:
+                    conn = self.track(addr, ts=ts, state='init', **kwargs)
+                # align the sequence numbers when we first see a connection
+                if conn.nextoffset['cs'] is None and addr == conn.addr:
+                    conn.nextoffset['cs'] = tcp.seq + 1
+                elif conn.nextoffset['sc'] is None and addr != conn.addr:
+                    conn.nextoffset['sc'] = tcp.seq + 1
                 self.track(addr, str(tcp.data), ts,
-                           state='established', offset=tcp.seq, **kwargs)
+                    state='established', offset=tcp.seq, **kwargs)
+
+            else:
+                # otherwise, only track connections if we see a TCP handshake
+                if (tcp.flags == dpkt.tcp.TH_SYN
+                    or tcp.flags == dpkt.tcp.TH_SYN | dpkt.tcp.TH_CWR | dpkt.tcp.TH_ECE):
+                    # SYN
+                    if conn:
+                        # if a connection already exists for the addr,
+                        # close the old one to start fresh
+                        self.close(conn, ts)
+                    conn = self.track(addr, ts=ts, state='init', **kwargs)
+                    if conn:
+                        conn.nextoffset['cs'] = tcp.seq + 1
+                elif tcp.flags == (dpkt.tcp.TH_SYN | dpkt.tcp.TH_ACK):
+                    # SYN ACK
+                    if conn and tcp.ack == conn.nextoffset['cs']:
+                        conn.nextoffset['sc'] = tcp.seq + 1
+                        conn.state = 'established'
+                if conn and conn.state == 'established':
+                    self.track(addr, str(tcp.data), ts,
+                        state='established', offset=tcp.seq, **kwargs)
+
+            # close connection
+            if conn and tcp.flags & (dpkt.tcp.TH_FIN | dpkt.tcp.TH_RST):
+                # flag that an IP is closing a connection with FIN or RST
+                conn.closeIP(addr[0])
+            if conn and conn.connectionClosed():
+                self.close(conn, ts)
 
         except Exception, e:
             self._exc(e)
@@ -845,6 +883,7 @@ class Connection(Packet):
             {client|server}countrycode, {client|server}asn: aliases of sip/dip country codes and ASNs
             clientpackets, serverpackets: counts of packets from client and server
             clientbytes, serverbytes: total bytes from client and server
+            clientclosed, serverclosed: flag indicating if a direction has closed the connection
             starttime,endtime: timestamps of start and end (or last packet) time of connection.
             direction: indicates direction of last traffic:
                     'init' : established, no traffic
@@ -856,12 +895,13 @@ class Connection(Packet):
             stop: if True, stopped following stream
 
     """
+    
     MAX_OFFSET = 0xffffffff  # max offset before wrap, default is MAXINT32 for TCP sequence numbers
 
     def __init__(self, decoder, addr, ts=None, **kwargs):
         self.state = None
         # the offset we expect for the next blob in this direction
-        self.nextoffset = {'cs': 0, 'sc': 0}
+        self.nextoffset = {'cs': None, 'sc': None}
         # init IP-level data
         Packet.__init__(self, decoder, addr, ts=ts, **kwargs)
         self.clientip, self.clientport, self.serverip, self.serverport = (
@@ -876,6 +916,8 @@ class Connection(Packet):
         self.serverpackets = 0
         self.clientbytes = 0
         self.serverbytes = 0
+        self.clientclosed = False
+        self.serverclosed = False
         self.starttime = self.ts        # datetime Obj containing start time
         self.endtime = self.ts
         # first update will change this, creating first blob
@@ -905,20 +947,36 @@ class Connection(Packet):
             (util.mktime(self.endtime) - util.mktime(self.starttime)),
             self.state)
 
+    def connectionClosed(self):
+        return self.serverclosed and self.clientclosed
+
+    def closeIP(self, tuple):
+        '''
+            Track if we have seen a FIN packet from given tuple
+            tuple should be of form (ip, port)
+        '''
+        if tuple == (self.clientip, self.clientport):
+            self.clientclosed = True
+        if tuple == (self.serverip, self.serverport):
+            self.serverclosed = True
+
     def update(self, ts, direction, data, offset=None):
         # if we have no blobs or direction changes, start a new blob
         lastblob = None
-        if direction != self.direction:
-            self.direction = direction
-            # if we have a finished blob, return it
-            if self.blobs:
-                lastblob = self.blobs[-1]
-            # for tracking offsets across blobs (TCP) set the startoffset of this blob to what we know it should be
-            # this may not necessarily be the offset of THIS data if packets
-            # are out of order
-            self.blobs.append(
-                Blob(ts, direction, startoffset=self.nextoffset[direction]))
-        self.blobs[-1].update(ts, data, offset=offset)  # update latest blob
+        if len(self.blobs) > 1 and self.blobs[-2].startoffset <= offset < self.blobs[-2].endoffset:
+            self.blobs[-2].update(ts,data,offset=offset)
+        else:
+            if direction != self.direction:
+                self.direction = direction
+                # if we have a finished blob, return it
+                if self.blobs:
+                    lastblob = self.blobs[-1]
+                # for tracking offsets across blobs (TCP) set the startoffset of this blob to what we know it should be
+                # this may not necessarily be the offset of THIS data if packets
+                # are out of order
+                self.blobs.append(
+                    Blob(ts, direction, startoffset=self.nextoffset[direction]))
+            self.blobs[-1].update(ts, data, offset=offset)  # update latest blob
         if direction == 'cs':
             self.clientpackets += 1
             self.clientbytes += len(data)
@@ -928,7 +986,7 @@ class Connection(Packet):
         self.endtime = ts
         # if we are tracking offsets, expect the next blob to be where this one
         # ends so far
-        if offset != None and offset >= self.nextoffset[direction]:
+        if offset != None and ((offset + len(data)) & self.MAX_OFFSET) >= self.nextoffset[direction]:
             self.nextoffset[direction] = (offset + len(data)) & self.MAX_OFFSET
         return lastblob
 
@@ -982,7 +1040,7 @@ class Blob(Data):
         if ts > self.endtime:
             self.endtime = ts
         # update the end offset if this packet goes at the end
-        if offset >= self.endoffset:
+        if (offset + len(data)) & self.MAX_OFFSET >= self.endoffset:
             self.endoffset = (offset + len(data)) & self.MAX_OFFSET
 
     def __repr__(self):
@@ -992,7 +1050,7 @@ class Blob(Data):
         '''returns segments of blob as string'''
         return self.data(padding='')
 
-    def data(self, errorHandler=None, padding=None, overlap=True, caller=None, dup=-1):
+    def data(self, errorHandler=None, padding=None, overlap=True, caller=None):
         '''returns segments of blob reassembled into a string
            if next segment offset is not the expected offset
            errorHandler(blob,expected,offset) will be called
@@ -1009,6 +1067,7 @@ class Blob(Data):
             dup: how to handle duplicate segments:
                 0: use first segment seen
                 -1 (default): use last segment seen
+            changing duplicate segment handling to always take largest segment
         '''
         d = ''
         nextoffset = self.startoffset
@@ -1028,12 +1087,17 @@ class Blob(Data):
                         raise KeyError(nextoffset)
                 elif segoffset < nextoffset and not overlap:
                     continue  # skip if not allowing overlap
+            #find most data in segments
+            seg = ''
+            for x in self.segments[segoffset]:
+                if len(x) > len(seg):
+                    seg = x
             # advance next expected offset
             nextoffset = (
-                segoffset + len(self.segments[segoffset][dup])) & self.MAX_OFFSET
+                segoffset + len(seg)) & self.MAX_OFFSET
             # append or splice data
             d = d[:segoffset - self.startoffset] + \
-                self.segments[segoffset][dup] + \
+                seg + \
                 d[nextoffset - self.startoffset:]
         return d
 
